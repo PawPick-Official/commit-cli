@@ -1,0 +1,36 @@
+header: "[<scope>][<type>]: <message>"
+
+scope:
+  - "TOOL"
+  - "DEVOPS"
+
+type:
+  - Add: "+"
+  - Modify: "~"
+  - Fix: "!"
+  - Delete: "-"
+
+body: |-
+  {{- if .Description }}
+  {{ println .Description }}
+  {{- end }}
+  {{- if .Added }}
+  Added:
+  {{- range .Added }}
+    {{ . }}
+  {{- end }}
+  {{- end }}
+
+  {{- if .Modified }}
+  Modified:
+  {{- range .Modified }}
+    {{ . }}
+  {{- end }}
+  {{- end }}
+
+  {{- if .Deleted }}
+  Deleted:
+  {{- range .Deleted }}
+    {{ . }}
+  {{- end }}
+  {{- end }}
