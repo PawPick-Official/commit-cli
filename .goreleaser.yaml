@@ -1,0 +1,78 @@
+version: 2
+
+project_name: commit-cli
+
+builds:
+  - env: [CGO_ENABLED=0]
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    main: .
+    binary: commit-cli
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: commit-cli
+    repository:
+      owner: pawpick-official
+      name: homebrew-commit-cli
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/pawpick-official/commit-cli
+    description: "A CLI tool for commits."
+    license: MIT
+    commit_author:
+      name: goreleaser-bot
+      email: bot@pawpick-official.com
+    install: |
+      bin.install "commit-cli"
+    test: |
+      system "#{bin}/commit-cli --version"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/pawpick-official/commit-cli:{{ .Version }}"
+      - "ghcr.io/pawpick-official/commit-cli:latest"
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.url=https://github.com/pawpick-official/commit-cli"
+      - "--label=org.opencontainers.image.source=https://github.com/pawpick-official/commit-cli"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.created={{ time \"2006-01-02T15:04:05Z07:00\" }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=MIT"
+
+nfpms:
+  - maintainer: Xavier <xavier.rognon@epitech.eu>
+    description: A CLI tool for commits.
+    homepage: https://github.com/pawpick-official/commit-cli
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
