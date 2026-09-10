@@ -39,7 +39,7 @@ brews:
   - name: commit-cli
     repository:
       owner: pawpick-official
-      name: homebrew-commit-cli
+      name: homebrew-tap
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
     homepage: https://github.com/pawpick-official/commit-cli
     description: "A CLI tool for commits."
