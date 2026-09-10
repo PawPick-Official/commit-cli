@@ -91,11 +91,6 @@ func (c *commitWriter) rebuildForm() tea.Cmd {
 		bodyFields = append(bodyFields, huh.NewInput().Title(c.bodyfields[i].name).Value(&c.bodyfields[i].value))
 	}
 
-	// A single group for the whole page: huh's Group.Init focuses the first
-	// non-skipping field of every group (even inactive ones), so multiple
-	// groups would show one focused field per group. LayoutStack renders
-	// Group.Content() which skips the group title, so section titles are
-	// Note fields instead; tab/shift+tab navigation skips them.
 	allFields := append(
 		[]huh.Field{huh.NewNote().Title("Commit Message")},
 		messageFields...,

@@ -22,13 +22,14 @@ body: |-
   {{- end }}
 
   {{- if .Modified }}
+  {{ print "" }}
   Modified:
   {{- range .Modified }}
     {{ . }}
   {{- end }}
   {{- end }}
-
   {{- if .Deleted }}
+  {{ print "" }}
   Deleted:
   {{- range .Deleted }}
     {{ . }}
