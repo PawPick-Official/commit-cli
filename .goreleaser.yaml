@@ -11,7 +11,7 @@ builds:
     goarch:
       - amd64
       - arm64
-    main: .
+    main: cmd/commit-cli/main.go
     binary: commit-cli
     ldflags:
       - -s -w -X main.version={{ .Version }}
