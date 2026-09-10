@@ -34,7 +34,7 @@ jobs:
           app-id: ${{ vars.TAP_APP_ID }}
           private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: commit-cli
+          repositories: homebrew-tap
 
       - name: Login to Github Container Registry
         if: success() && startsWith(github.ref, 'refs/tags/')
