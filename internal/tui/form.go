@@ -63,6 +63,14 @@ func (m *rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Background preview renders belong to page 0 even when page 1 is
+	// shown: without this the queue would stall on the commit page and
+	// late results would be lost.
+	if _, ok := msg.(previewReadyMsg); ok {
+		_, cmd := m.pages[0].Update(msg)
+		return m, cmd
+	}
+
 	if key, ok := msg.(tea.KeyMsg); ok && key.String() == "esc" {
 		return m, tea.Quit
 	}

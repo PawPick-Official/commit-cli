@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/alecthomas/chroma/v2/quick"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
@@ -31,6 +32,14 @@ type filePicker struct {
 
 	diffCache map[string]string // rendered diff per path, avoids git exec per message
 
+	// Background preview queue: previews render one by one in tea.Cmds
+	// (Bubble Tea runs those off the main thread) and come back as
+	// previewReadyMsg. rendering holds the path in flight ("" = idle);
+	// staleRendering drops its result when a toggle outdated it mid-flight.
+	rendering      string
+	staleRendering bool
+	spinner        spinner.Model
+
 	hovered string
 	err     error
 
@@ -42,10 +51,13 @@ type filePicker struct {
 }
 
 func newFilePicker(statuses []git.FileStatus) *filePicker {
+	spin := spinner.New(spinner.WithSpinner(spinner.Line))
+	spin.Style = loaderStyle
 	p := &filePicker{
 		files:     make(map[string]*git.FileStatus, len(statuses)),
 		synced:    make(map[string]bool, len(statuses)),
 		diffCache: make(map[string]string, len(statuses)),
+		spinner:   spin,
 	}
 
 	for i := range statuses {
@@ -60,7 +72,67 @@ func newFilePicker(statuses []git.FileStatus) *filePicker {
 
 	p.rebuildForm()
 
+	// rebuildForm queued a render whose Cmd is discarded here (the chain
+	// really starts in Init): reset the flag so the queue can start.
+	p.rendering = ""
+
 	return p
+}
+
+// optionPrefixWidth is the width huh reserves at the start of every option
+// line: the "> " cursor selector plus the "[•] "/"[ ] " selection prefix.
+const optionPrefixWidth = 6
+
+// listPaneWidth returns the outer width of the file list pane for a terminal
+// of the given width.
+func listPaneWidth(termWidth int) int {
+	return max(20, termWidth/3)
+}
+
+// labelWidth returns the max width of a file label ("XY path") so that an
+// option always fits on a single line of the list pane.
+func (p *filePicker) labelWidth() int {
+	width := p.width
+	if width <= 0 {
+		width = 80
+	}
+	pane := listPaneWidth(width)
+	// Pane padding (2) + huh base margin (2) + option prefix (6).
+	return max(8, pane-2-2-optionPrefixWidth)
+}
+
+// applySize constrains the fresh form to the terminal dimensions. huh only
+// auto-sizes a form when it receives a WindowSizeMsg, which a rebuilt form
+// never gets: without this, toggling a file (which rebuilds the form)
+// renders every option at full width, pushing the header off-screen and
+// wrapping long paths onto two lines.
+func (p *filePicker) applySize() {
+	if p.width <= 0 || p.height <= 0 {
+		return
+	}
+	pane := listPaneWidth(p.width)
+	// The field box plus the huh base margin must fit the pane content, so
+	// pre-truncated labels never wrap onto a second line.
+	p.form.WithWidth(max(10, pane-4))
+
+	// Only cap when the options overflow, so small repos keep a compact
+	// list. Both levels are capped: the field height pins the
+	// title/description and scrolls the options, the form height shrinks
+	// the group viewport (which would otherwise pad back to full height).
+	// The exact chrome (title + wrapped description lines) is measured, so
+	// shrink until the form fits. Must run after form.Init() so the
+	// viewports hold content.
+	if needed := len(p.order) + 1 + 2; needed > p.height {
+		h := max(5, p.height-4)
+		for {
+			p.select_.Height(h)
+			p.form.WithHeight(h + 2)
+			if h <= 5 || lipgloss.Height(p.form.View()) <= p.height-2 {
+				break
+			}
+			h--
+		}
+	}
 }
 
 // rebuildForm recreates the multiselect with labels matching the current file
@@ -68,9 +140,10 @@ func newFilePicker(statuses []git.FileStatus) *filePicker {
 // returns the form's Init command, which must be run for the new form to
 // become active and render.
 func (p *filePicker) rebuildForm() tea.Cmd {
+	maxPath := max(1, p.labelWidth()-7) // room for the "XY " status prefix
 	options := make([]huh.Option[string], 0, len(p.order))
 	for _, path := range p.order {
-		options = append(options, huh.NewOption(statusLabel(p.files[path]), path))
+		options = append(options, huh.NewOption(statusLabel(p.files[path], maxPath), path))
 	}
 
 	cursor := p.cursorPosition()
@@ -91,15 +164,22 @@ func (p *filePicker) rebuildForm() tea.Cmd {
 			return nil
 		})
 
-	p.form = huh.NewForm(huh.NewGroup(p.select_).Title("Select file to commit\n")).WithTheme(theme)
+	// The group help footer is hidden: its single-line key list overflows
+	// the narrow pane, and the description already documents the keys.
+	p.form = huh.NewForm(huh.NewGroup(p.select_).Title("Select file to commit\n").WithShowHelp(false)).WithTheme(theme)
 
 	// A fresh form renders nothing until Init activates its group.
 	init := p.form.Init()
 
+	// Size after Init so applySize measures a rendered form.
+	p.applySize()
+
 	p.setCursor(cursor)
 	p.refreshPreview()
 
-	return init
+	// Restart the queue if idle (e.g. a toggle invalidated a preview while
+	// nothing was in flight); no-op when a render already runs.
+	return tea.Batch(init, p.startNextRender())
 }
 
 // cursorPosition returns the index of the hovered option, used to restore the
@@ -126,20 +206,73 @@ func (p *filePicker) setCursor(cursor int) {
 	}
 }
 
-// renderDiff computes the colored diff of a file, or a placeholder when
-// there is nothing to show.
-func (p *filePicker) renderDiff(path string) string {
-	content := diffContent(p.files[path])
+// previewReadyMsg carries a background-rendered preview back to the main
+// thread: git diff + chroma highlighting run inside the tea.Cmd.
+type previewReadyMsg struct {
+	path    string
+	content string
+}
+
+// renderPreview computes the colored diff of a file, or a placeholder when
+// there is nothing to show. It only touches its by-value status copy, so it
+// is safe to run off the main thread: toggling a file mutates the original
+// struct while this may be reading.
+func renderPreview(status git.FileStatus) string {
+	content := diffContent(&status)
 	if content == "" {
 		content = lipgloss.NewStyle().Foreground(lipgloss.Color("#7f849c")).
-			Render("No diff for " + path)
+			Render("No diff for " + status.Path)
 	}
 	return content
 }
 
+// startNextRender queues the render of the next uncached preview, one at a
+// time with no priority: the hovered file simply shows the loader until its
+// turn comes. It returns nil when a render is already in flight or the queue
+// is drained, so at most one background render ever runs.
+func (p *filePicker) startNextRender() tea.Cmd {
+	if p.rendering != "" {
+		return nil
+	}
+	for _, path := range p.order {
+		if _, ok := p.diffCache[path]; ok {
+			continue
+		}
+		status := *p.files[path] // copy: the background Cmd must not share state
+		p.rendering = path
+		p.staleRendering = false
+		return tea.Batch(
+			func() tea.Msg { return previewReadyMsg{path: path, content: renderPreview(status)} },
+			p.spinner.Tick,
+		)
+	}
+	return nil
+}
+
+// handlePreviewReady stores a background render and chains the next one. A
+// result outdated by a mid-flight toggle is dropped and re-queued.
+func (p *filePicker) handlePreviewReady(msg previewReadyMsg) (tea.Model, tea.Cmd) {
+	p.rendering = ""
+	if p.staleRendering {
+		p.staleRendering = false
+		delete(p.diffCache, msg.path)
+		return p, p.startNextRender()
+	}
+	p.diffCache[msg.path] = msg.content
+	p.refreshPreview() // swaps the loader for content if still hovered
+	return p, p.startNextRender()
+}
+
+// loaderView renders the waiting state shown while the hovered file has no
+// cached preview yet.
+func (p *filePicker) loaderView() string {
+	return loaderStyle.Render(p.spinner.View() + " Loading diff…")
+}
+
 // refreshPreview loads the diff of the currently hovered file into the
-// viewport, using the cache to avoid re-running git and chroma on every
-// message (scroll keys included).
+// viewport from the cache, or the loader when its background render has not
+// finished yet. It never renders synchronously: the main thread stays
+// responsive no matter how slow git or chroma are.
 func (p *filePicker) refreshPreview() {
 	hovered, ok := p.select_.Hovered()
 	if !ok {
@@ -148,8 +281,13 @@ func (p *filePicker) refreshPreview() {
 
 	content, cached := p.diffCache[hovered]
 	if !cached {
-		content = p.renderDiff(hovered)
-		p.diffCache[hovered] = content
+		// Background render pending: show the loader until previewReadyMsg.
+		p.preview.SetContent(p.loaderView())
+		if p.hovered != hovered {
+			p.hovered = hovered
+			p.preview.GotoTop()
+		}
+		return
 	}
 
 	// Keep the scroll position when the preview is still about the same file
@@ -166,11 +304,40 @@ func (p *filePicker) refreshPreview() {
 }
 
 func (p *filePicker) Init() tea.Cmd {
-	return p.form.Init()
+	// The form activates on the main thread while the first preview renders
+	// in the background; not-yet-rendered files show the loader.
+	return tea.Batch(p.form.Init(), p.startNextRender())
 }
 
 func (p *filePicker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Background renders land here, including while another page is shown
+	// (see rootModel): the queue must keep draining.
+	if ready, ok := msg.(previewReadyMsg); ok {
+		return p.handlePreviewReady(ready)
+	}
+
+	// Advance the loader animation while renders are in flight. Ticks stop
+	// with the queue: no Tick cmd is returned once idle.
+	if _, ok := msg.(spinner.TickMsg); ok {
+		var cmd tea.Cmd
+		p.spinner, cmd = p.spinner.Update(msg)
+		if p.rendering == "" {
+			return p, nil
+		}
+		if _, cached := p.diffCache[p.hovered]; !cached {
+			p.preview.SetContent(p.loaderView())
+		}
+		return p, cmd
+	}
+
 	if msg, ok := msg.(tea.WindowSizeMsg); ok {
+		// Rebuild so labels are re-truncated and the option viewport is
+		// height-limited for the new size. Only when the size actually
+		// changed: form.Init() re-emits WindowSize, which must not loop.
+		if msg.Width != p.width || msg.Height != p.height {
+			p.width, p.height = msg.Width, msg.Height
+			return p, p.rebuildForm()
+		}
 		p.width, p.height = msg.Width, msg.Height
 	}
 
@@ -230,6 +397,11 @@ func (p *filePicker) syncStaging() tea.Cmd {
 		p.err = nil
 		p.synced[path] = want
 		delete(p.diffCache, path) // the diff changes with the staging state
+		if path == p.rendering {
+			// A render of this file is in flight with the old state: drop
+			// its result on arrival and re-queue it.
+			p.staleRendering = true
+		}
 		changed = true
 	}
 
@@ -270,22 +442,23 @@ func (p *filePicker) View() string {
 
 // setSize syncs this page with the terminal dimensions, so the file list and
 // the preview can fill the whole page. It must be called before every render.
+// previewWidth/frameHeight are the preview's outer box (border included);
+// the viewport is sized to the inner area so its lines never overflow the
+// border and wrap onto extra lines.
 func (p *filePicker) setSize(width, height int) {
 	p.width, p.height = width, height
 
-	listWidth := p.width / 3
-	listWidth = max(20, listWidth)
-	previewWidth := p.width - listWidth
+	p.listWidth = listPaneWidth(p.width)
+	// The border stacks outside Width/Height: the preview totals
+	// previewWidth+2 by frameHeight+2.
+	p.previewWidth = max(8, p.width-p.listWidth-2)
+	p.frameHeight = max(2, p.height-2)
 
-	pageHeight := p.height
-
-	p.frameHeight = max(0, pageHeight-2)
-	p.listWidth = listWidth
-	p.previewWidth = previewWidth - 4
-
-	if p.preview.Width != previewWidth-2 || p.preview.Height != p.frameHeight-2 {
-		p.preview.Width = previewWidth
-		p.preview.Height = max(0, p.frameHeight)
+	innerW := max(0, p.previewWidth-2)
+	innerH := max(0, p.frameHeight)
+	if p.preview.Width != innerW || p.preview.Height != innerH {
+		p.preview.Width = innerW
+		p.preview.Height = innerH
 	}
 }
 
@@ -344,7 +517,7 @@ func diffContent(file *git.FileStatus) string {
 			b.WriteString(diffAddStyle.Render("+") + " │  " + highlightCode(strings.TrimPrefix(line, "+"), file.Path) + "\n")
 			adds++
 		case strings.HasPrefix(line, "-"):
-			b.WriteString(diffAddStyle.Render("-") + " │  " + highlightCode(strings.TrimPrefix(line, "-"), file.Path) + "\n")
+			b.WriteString(diffRemoveStyle.Render("-") + " │  " + highlightCode(strings.TrimPrefix(line, "-"), file.Path) + "\n")
 			removes++
 		case strings.HasPrefix(line, "@@"):
 			continue
@@ -372,8 +545,39 @@ func highlightCode(line, path string) string {
 	return strings.TrimSuffix(buf.String(), "\n")
 }
 
-func statusLabel(status *git.FileStatus) string {
-	return fmt.Sprintf("%s%s %s", statusLetter(status.StatusIndex), statusLetter(status.StatusWorktree), status.Path)
+func statusLabel(status *git.FileStatus, maxPathWidth int) string {
+	return fmt.Sprintf("%s%s %s",
+		statusLetter(status.StatusIndex),
+		statusLetter(status.StatusWorktree),
+		truncateStart(status.Path, maxPathWidth))
+}
+
+// truncateStart shortens s to fit maxWidth, keeping the end (the file name)
+// visible: "…/long/path/file.go". Widths are cell widths, not bytes.
+func truncateStart(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+	const ellipsis = "…"
+	budget := maxWidth - lipgloss.Width(ellipsis)
+	if budget <= 0 {
+		return ellipsis
+	}
+	runes := []rune(s)
+	w := 0
+	i := len(runes)
+	for i > 0 {
+		rw := lipgloss.Width(string(runes[i-1]))
+		if w+rw > budget {
+			break
+		}
+		w += rw
+		i--
+	}
+	return ellipsis + string(runes[i:])
 }
 
 func statusLetter(status int) string {

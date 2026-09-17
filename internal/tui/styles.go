@@ -27,6 +27,9 @@ var (
 
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 
+	// loaderStyle dims the preview waiting state (spinner + text).
+	loaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7f849c"))
+
 	// cliErrorStyle formats fatal errors printed when the TUI is not running:
 	// a bold red "Error:" prefix followed by the italic message.
 	cliErrorStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e78284"))
