@@ -28,14 +28,12 @@ func (file *FileStatus) Update() error {
 		return err
 	}
 
-	for line := range strings.SplitSeq(string(outputBytes), "\x00") {
-		if line == "" {
-			continue
-		}
-		status, err := GetFileStatus(line)
-		if err != nil {
-			return err
-		}
+	statuses, err := fileStatuses(string(outputBytes))
+	if err != nil {
+		return err
+	}
+
+	for _, status := range statuses {
 		if status.Path == file.Path {
 			file.StatusIndex = status.StatusIndex
 			file.StatusWorktree = status.StatusWorktree
@@ -44,6 +42,61 @@ func (file *FileStatus) Update() error {
 	}
 
 	return fmt.Errorf("file %s not found in git status output", file.Path)
+}
+
+// parseFileStatus parses a single entry of `git status --porcelain=v1 -z`
+// output. It returns the parsed status and the number of NUL-separated fields
+// the entry spans. Renamed and copied entries span two fields: the new path is
+// followed by the original path.
+func parseFileStatus(entry string) (FileStatus, int, error) {
+	if len(entry) < 3 {
+		return FileStatus{}, 0, fmt.Errorf("malformed git status entry: %q", entry)
+	}
+
+	statusIndex, err := GetFileStatusFromByte(entry[0])
+	if err != nil {
+		return FileStatus{}, 0, err
+	}
+	statusWorktree, err := GetFileStatusFromByte(entry[1])
+	if err != nil {
+		return FileStatus{}, 0, err
+	}
+
+	fields := 1
+	if statusIndex == RENAMED || statusIndex == COPIED {
+		fields = 2
+	}
+
+	return FileStatus{
+		Path:           entry[3:],
+		StatusIndex:    statusIndex,
+		StatusWorktree: statusWorktree,
+	}, fields, nil
+}
+
+// fileStatuses parses the NUL-separated output of `git status --porcelain=v1 -z`.
+func fileStatuses(output string) ([]FileStatus, error) {
+	var statuses []FileStatus
+
+	entries := strings.Split(output, "\x00")
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if entry == "" {
+			continue
+		}
+
+		status, fields, err := parseFileStatus(entry)
+		if err != nil {
+			return nil, err
+		}
+		statuses = append(statuses, status)
+
+		// Skip the original path of renamed/copied entries, which is not a
+		// status entry of its own.
+		i += fields - 1
+	}
+
+	return statuses, nil
 }
 
 func GetFileStatusFromByte(statusByte byte) (int, error) {
@@ -68,42 +121,16 @@ func GetFileStatusFromByte(statusByte byte) (int, error) {
 }
 
 func GetFileStatus(output string) (FileStatus, error) {
-	statusBytes := []byte(string([]rune(output)[0:2]))
-	statusIndex, err := GetFileStatusFromByte(statusBytes[0])
-	if err != nil {
-		return FileStatus{}, err
-	}
-	statusWorktree, err := GetFileStatusFromByte(statusBytes[1])
-	if err != nil {
-		return FileStatus{}, err
-	}
-
-	return FileStatus{
-		Path:           string([]rune(output)[3:]),
-		StatusIndex:    statusIndex,
-		StatusWorktree: statusWorktree,
-	}, nil
+	status, _, err := parseFileStatus(output)
+	return status, err
 }
 
 func GetAllFileStatuses() ([]FileStatus, error) {
-	var statuses []FileStatus
-
 	cmd := Command("status", "--porcelain=v1", "-z", "-uall")
 	outputBytes, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
 
-	for line := range strings.SplitSeq(string(outputBytes), "\x00") {
-		if line == "" {
-			continue
-		}
-		status, err := GetFileStatus(line)
-		if err != nil {
-			return nil, err
-		}
-		statuses = append(statuses, status)
-	}
-
-	return statuses, nil
+	return fileStatuses(string(outputBytes))
 }
